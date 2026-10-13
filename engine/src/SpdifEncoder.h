@@ -39,8 +39,9 @@ public:
   // input is always downmixed to 5.1 (by swr) regardless.
   enum class Upmix
   {
-    Off,       // swr default rematrix (front channels only-ish)
-    Surround,  // FFmpeg `surround` libavfilter (FFT-based steered upmix)
+    Off,       // Normal swresample conversion
+  Surround,  // Existing stereo-to-5.1 surround upmix
+  Stereo6,   // Treat six-channel input as stereo in FL/FR
   };
 
   struct Params
@@ -90,6 +91,7 @@ private:
 
   // surround-upmix pipeline (used when upmix == Surround and input is <= 2ch)
   bool             useFilter_ = false;
+  bool stereo6Mode_ = false;
   AVFilterGraph*   graph_     = nullptr;
   AVFilterContext* fsrc_      = nullptr; // abuffer
   AVFilterContext* fsink_     = nullptr; // abuffersink
@@ -97,6 +99,7 @@ private:
   AVFrame*         filtFrame_ = nullptr; // scratch for draining the sink
 
   AVChannelLayout  inLayout_{};
+  AVChannelLayout  filterInputLayout_{};
   AVSampleFormat   inSampleFmt_ = AV_SAMPLE_FMT_FLT;
   int              sampleRate_ = 48000;
   int              framesPerPacket_ = 0;

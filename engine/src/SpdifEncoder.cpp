@@ -83,12 +83,16 @@ bool SpdifEncoder::Init(const Params& p)
 
   // Input conditioning: either the `surround` upmix filter (stereo->5.1) or plain swr
   // convert/downmix. Surround only applies to <= 2ch input; multichannel always downmixes.
-  useFilter_ = (p.upmix == Upmix::Surround && inLayout_.nb_channels <= 2);
-  if (useFilter_ && !BuildFilterGraph())
-  {
-    std::fprintf(stderr, "[SpdifEncoder] surround upmix unavailable; using plain upmix/downmix\n");
-    useFilter_ = false;
-  }
+  stereo6Mode_ = (p.upmix == Upmix::Stereo6 && inLayout_.nb_channels == 6);
+  useFilter_ = (p.upmix == Upmix::Surround && inLayout_.nb_channels <= 2) ||
+             stereo6Mode_;
+
+if (useFilter_ && !BuildFilterGraph())
+{
+  std::fprintf(stderr, "[SpdifEncoder] surround upmix unavailable; using plain upmix/downmix\n");
+  useFilter_ = false;
+  stereo6Mode_ = false;
+}
   if (!useFilter_)
   {
     // swr: interleaved input -> planar-float 5.1 (encoder layout), same sample rate.
@@ -146,31 +150,45 @@ void SpdifEncoder::Close()
   if (fifo_)      { av_audio_fifo_free(fifo_); fifo_ = nullptr; }
   if (filtFrame_) av_frame_free(&filtFrame_);
   useFilter_ = false;
+  stereo6Mode_ = false;
   if (swr_)       swr_free(&swr_);
   if (frame_)     av_frame_free(&frame_);
   if (pkt_)       av_packet_free(&pkt_);
   if (codecCtx_)  avcodec_free_context(&codecCtx_);
   av_channel_layout_uninit(&inLayout_);
+  av_channel_layout_uninit(&filterInputLayout_);
   framesPerPacket_ = 0;
   nextPts_ = 0;
 }
+
 
 bool SpdifEncoder::BuildFilterGraph()
 {
   graph_ = avfilter_graph_alloc();
   if (!graph_) return false;
 
+  if (stereo6Mode_)
+  {
+    av_channel_layout_uninit(&filterInputLayout_);
+    av_channel_layout_default(&filterInputLayout_, 2);
+  }
+  else
+  {
+    av_channel_layout_copy(&filterInputLayout_, &inLayout_);
+  }
+
   char inDesc[64] = {0}, outDesc[64] = {0};
-  av_channel_layout_describe(&inLayout_, inDesc, sizeof inDesc);
+  av_channel_layout_describe(&filterInputLayout_, inDesc, sizeof inDesc);
   av_channel_layout_describe(&codecCtx_->ch_layout, outDesc, sizeof outDesc);
 
   const AVFilter* abuffer = avfilter_get_by_name("abuffer");
   const AVFilter* surround = avfilter_get_by_name("surround");
   const AVFilter* aformat = avfilter_get_by_name("aformat");
   const AVFilter* abuffersink = avfilter_get_by_name("abuffersink");
+
   if (!abuffer || !surround || !aformat || !abuffersink)
   {
-    std::fprintf(stderr, "[SpdifEncoder] a required avfilter is missing (surround/aformat/abuffer)\n");
+    std::fprintf(stderr, "[SpdifEncoder] a required avfilter is missing\n");
     return false;
   }
 
@@ -178,78 +196,190 @@ bool SpdifEncoder::BuildFilterGraph()
   std::snprintf(srcArgs, sizeof srcArgs,
                 "sample_rate=%d:sample_fmt=%s:channel_layout=%s:time_base=1/%d",
                 sampleRate_, av_get_sample_fmt_name(inSampleFmt_), inDesc, sampleRate_);
+
   char surArgs[128];
   std::snprintf(surArgs, sizeof surArgs, "chl_in=%s:chl_out=%s", inDesc, outDesc);
+
   char fmtArgs[256];
-  std::snprintf(fmtArgs, sizeof fmtArgs, "sample_fmts=fltp:sample_rates=%d:channel_layouts=%s",
+  std::snprintf(fmtArgs, sizeof fmtArgs,
+                "sample_fmts=fltp:sample_rates=%d:channel_layouts=%s",
                 sampleRate_, outDesc);
 
   AVFilterContext* surCtx = nullptr;
   AVFilterContext* fmtCtx = nullptr;
   int rc;
-  if ((rc = avfilter_graph_create_filter(&fsrc_, abuffer, "in", srcArgs, nullptr, graph_)) < 0)
-  { LogAv("create abuffer", rc); return false; }
-  if ((rc = avfilter_graph_create_filter(&surCtx, surround, "surround", surArgs, nullptr, graph_)) < 0)
-  { LogAv("create surround", rc); return false; }
-  if ((rc = avfilter_graph_create_filter(&fmtCtx, aformat, "aformat", fmtArgs, nullptr, graph_)) < 0)
-  { LogAv("create aformat", rc); return false; }
-  if ((rc = avfilter_graph_create_filter(&fsink_, abuffersink, "out", nullptr, nullptr, graph_)) < 0)
-  { LogAv("create abuffersink", rc); return false; }
+
+  if ((rc = avfilter_graph_create_filter(
+           &fsrc_, abuffer, "in", srcArgs, nullptr, graph_)) < 0)
+  {
+    LogAv("create abuffer", rc);
+    return false;
+  }
+
+  if ((rc = avfilter_graph_create_filter(
+           &surCtx, surround, "surround", surArgs, nullptr, graph_)) < 0)
+  {
+    LogAv("create surround", rc);
+    return false;
+  }
+
+  if ((rc = avfilter_graph_create_filter(
+           &fmtCtx, aformat, "aformat", fmtArgs, nullptr, graph_)) < 0)
+  {
+    LogAv("create aformat", rc);
+    return false;
+  }
+
+  if ((rc = avfilter_graph_create_filter(
+           &fsink_, abuffersink, "out", nullptr, nullptr, graph_)) < 0)
+  {
+    LogAv("create abuffersink", rc);
+    return false;
+  }
 
   if ((rc = avfilter_link(fsrc_, 0, surCtx, 0)) < 0 ||
       (rc = avfilter_link(surCtx, 0, fmtCtx, 0)) < 0 ||
       (rc = avfilter_link(fmtCtx, 0, fsink_, 0)) < 0)
-  { LogAv("avfilter_link", rc); return false; }
+  {
+    LogAv("avfilter_link", rc);
+    return false;
+  }
 
   if ((rc = avfilter_graph_config(graph_, nullptr)) < 0)
-  { LogAv("avfilter_graph_config", rc); return false; }
+  {
+    LogAv("avfilter_graph_config", rc);
+    return false;
+  }
 
-  fifo_ = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, codecCtx_->ch_layout.nb_channels, sampleRate_);
+  fifo_ = av_audio_fifo_alloc(
+      AV_SAMPLE_FMT_FLTP, codecCtx_->ch_layout.nb_channels, sampleRate_);
   filtFrame_ = av_frame_alloc();
+
   if (!fifo_ || !filtFrame_) return false;
 
-  // Prime with silence to warm the FFT and build a >= 2-packet cushion, so the real-time
-  // consumer doesn't starve mid-stream (the filter has inherent FFT latency).
-  const int inBytes =
-      framesPerPacket_ * inLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
-  std::vector<uint8_t> silence(static_cast<size_t>(inBytes), 0);
-  for (int guard = 0; guard < 64 && av_audio_fifo_size(fifo_) < 2 * framesPerPacket_; ++guard)
-    if (!FeedFilter(silence.data()))
-      break;
+  // Prime the surround filter with silence.
+ const int inBytes =
+    framesPerPacket_ * inLayout_.nb_channels *
+    av_get_bytes_per_sample(inSampleFmt_);
 
-  std::printf("[SpdifEncoder] surround upmix enabled (%s -> %s)\n", inDesc, outDesc);
+  std::vector<uint8_t> silence(static_cast<size_t>(inBytes), 0);
+
+  for (int guard = 0;
+       guard < 64 && av_audio_fifo_size(fifo_) < 2 * framesPerPacket_;
+       ++guard)
+  {
+    if (!FeedFilter(silence.data())) break;
+  }
+
+  std::printf("[SpdifEncoder] surround upmix enabled (%s -> %s)\n",
+              inDesc, outDesc);
   return true;
 }
 
+
 bool SpdifEncoder::FeedFilter(const uint8_t* in)
 {
+  const int bytesPerSample = av_get_bytes_per_sample(inSampleFmt_);
+if (bytesPerSample <= 0 || !in)
+  return false;
+if (av_sample_fmt_is_planar(inSampleFmt_))
+  return false;
+
+  const int filterChannels = filterInputLayout_.nb_channels;
+  if (filterChannels <= 0)
+    return false;
+
   const int inBytes =
-      framesPerPacket_ * inLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
+      framesPerPacket_ * filterChannels * bytesPerSample;
+
+  std::vector<uint8_t> stereoInput;
+
+  const uint8_t* filterData = in;
+
+  if (stereo6Mode_)
+  {
+    if (inLayout_.nb_channels != 6 || filterChannels != 2)
+      return false;
+
+    const int sourceBytes =
+        framesPerPacket_ * inLayout_.nb_channels * bytesPerSample;
+
+    stereoInput.resize(static_cast<size_t>(inBytes));
+
+    // Windows 5.1 order: FL, FR, FC, LFE, BL, BR.
+    // Copy FL and FR from each interleaved six-channel sample frame.
+    for (int i = 0; i < framesPerPacket_; ++i)
+    {
+      const uint8_t* src =
+          in + static_cast<size_t>(i) * inLayout_.nb_channels * bytesPerSample;
+
+      uint8_t* dst =
+          stereoInput.data() + static_cast<size_t>(i) * 2 * bytesPerSample;
+
+      std::memcpy(dst, src, static_cast<size_t>(bytesPerSample));
+      std::memcpy(dst + bytesPerSample, src + bytesPerSample,
+                  static_cast<size_t>(bytesPerSample));
+    }
+
+    (void)sourceBytes;
+    filterData = stereoInput.data();
+  }
 
   AVFrame* f = av_frame_alloc();
   if (!f) return false;
+
   f->format = inSampleFmt_;
-  av_channel_layout_copy(&f->ch_layout, &inLayout_);
+  if (av_channel_layout_copy(&f->ch_layout, &filterInputLayout_) < 0)
+  {
+    av_frame_free(&f);
+    return false;
+  }
+
   f->sample_rate = sampleRate_;
   f->nb_samples = framesPerPacket_;
-  if (av_frame_get_buffer(f, 0) < 0) { av_frame_free(&f); return false; }
-  std::memcpy(f->data[0], in, static_cast<size_t>(inBytes));
 
-  int rc = av_buffersrc_add_frame(fsrc_, f); // takes ownership of f's buffers, resets f
+  if (av_frame_get_buffer(f, 0) < 0)
+  {
+    av_frame_free(&f);
+    return false;
+  }
+
+  std::memcpy(f->data[0], filterData, static_cast<size_t>(inBytes));
+
+  int rc = av_buffersrc_add_frame(fsrc_, f);
   av_frame_free(&f);
-  if (rc < 0) { LogAv("av_buffersrc_add_frame", rc); return false; }
+
+  if (rc < 0)
+  {
+    LogAv("av_buffersrc_add_frame", rc);
+    return false;
+  }
 
   for (;;)
   {
     rc = av_buffersink_get_frame(fsink_, filtFrame_);
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
       break;
-    if (rc < 0) { LogAv("av_buffersink_get_frame", rc); return false; }
-    int w = av_audio_fifo_write(fifo_, reinterpret_cast<void**>(filtFrame_->data),
-                                filtFrame_->nb_samples);
+
+    if (rc < 0)
+    {
+      LogAv("av_buffersink_get_frame", rc);
+      return false;
+    }
+
+    int w = av_audio_fifo_write(
+        fifo_, reinterpret_cast<void**>(filtFrame_->data),
+        filtFrame_->nb_samples);
+
     av_frame_unref(filtFrame_);
-    if (w < 0) { LogAv("av_audio_fifo_write", w); return false; }
+
+    if (w < 0)
+    {
+      LogAv("av_audio_fifo_write", w);
+      return false;
+    }
   }
+
   return true;
 }
 

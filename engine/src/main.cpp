@@ -281,6 +281,7 @@ int main(int argc, char** argv)
   pp.bitRate = cfg.bitRate;
   pp.safeFrames = cfg.safeFrames;
   pp.upmixSurround = (cfg.upmix == "surround");
+  pp.upmixStereo6 = (cfg.upmix == "stereo6");
 
   WasapiPassthrough out;
   if (!out.Init(outDev.Get(), &ring, cf, pp)) return 1;
