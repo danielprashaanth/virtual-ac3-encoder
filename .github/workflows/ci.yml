@@ -34,5 +34,33 @@ jobs:
 
       - name: Unit tests (ctest)
         run: ctest --test-dir engine/build -C Release --output-on-failure
-        # The doctest suite already encodes PCM -> AC3 and checks the IEC 61937 burst,
-        # so the engine/encoder path is covered without needing a system ffmpeg here.
+
+      - name: Package engine and FFmpeg DLLs
+        shell: pwsh
+        run: |
+          $package = "engine-package"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+
+          $exe = "engine/build/Release/engine.exe"
+          if (!(Test-Path $exe)) {
+            throw "Built engine.exe not found at $exe"
+          }
+
+          Copy-Item $exe $package
+          Get-ChildItem $package -Filter "*.dll" | Remove-Item -Force
+          Copy-Item "engine/build/Release/*.dll" $package -ErrorAction Stop
+
+          if (!(Test-Path "$package/avcodec-62.dll")) {
+            Write-Host "Checking staged FFmpeg DLLs:"
+            Get-ChildItem $package -Filter "*.dll" | Select-Object -ExpandProperty Name
+          }
+
+          Compress-Archive -Path "$package/*" -DestinationPath "virtual-ac3-encoder-test.zip" -Force
+
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtual-ac3-encoder-test-windows-x64
+          path: virtual-ac3-encoder-test.zip
+          if-no-files-found: error
+          retention-days: 7
